@@ -1,0 +1,116 @@
+#!/bin/bash
+
+#Check if parameters are correct
+checkParameters (){
+	if [ "$1" = -h ] || [ "$1" = "help" ]
+	then
+		echo "Usage: allSqliteToMySQL [Folder TableMySQL User Password Column] 
+		Folder: The folder to scan for new file
+		TableSQLite: The table you want to import (only 1 table sorry)
+		User: Your MySQL username
+		Password: Your MySQL password
+		Column: If you want to exclude some columns from being imported (not necessary)"
+		exit 1;
+	elif [ -z $4 ]
+	then
+		echo "Invalid parameters. Check help or -h to verify."
+		exit 1;
+	fi
+}
+
+#Check if necessary dependances are here to launch the script
+checkDependances () {
+
+	Dependances=("inotifywait" "sqlite3" "mysql" "python" "wget")
+	for i in "${Dependances[@]}"
+	do
+		command -v $i >/dev/null 2>&1 || 
+		{ 
+			echo >&2 "I require $i but it's not installed.  Aborting."; 
+			exit 1; 
+		}
+	done
+	if [ ! -f sqliteToMysql.py ] 
+	then
+		wget -O sqliteToMysql.py http://www.redmine.org/attachments/download/6239/sqlite3-to-mysql.py
+		sed '21iline = line.replace("TABLE", "TABLE IF NOT EXISTS")' input.txt > sqliteToMysql.py
+	fi
+}
+
+#Watch the folder, check the file integrity and launch dump if it's ok
+checkNewFile (){
+
+inotifywait -q -r -e close_write --format '%w%f' "${MonitorDir}" | while read NewFile; do
+	CheckFileFormat=$(sqlite3 $NewFile "SELECT EXISTS (SELECT * FROM sqlite_master WHERE type='table' AND name='COMPANY');")
+	if [ $CheckFileFormat = 0 ] 
+	then
+		echo $NewFile
+		echo "The file is not a database or does not contain wanted table(s)"
+	else
+		CheckIntegrity=`sqlite3 $NewFile "pragma integrity_check;"`
+		if [ $CheckIntegrity = "ok" ]
+		then
+			echo "It's alright"
+			dumpSQLite $NewFile "$@"
+		else
+			echo $NewFile 
+			echo "Integrity not okay"
+		fi
+	fi
+done
+checkNewFile
+}
+
+#Launch the dump from sqlite to mysql
+dumpSQLite (){
+	ColumnToRemove="$6"
+	SqliteFile="$1"
+	SqliteBackup="./backup.sqlite"
+	#In order to not override the original databases if there is a problem
+	cp $SqliteFile $SqliteBackup
+	TableName=$(sqlite3 $SqliteBackup ".table")
+	ColumnsNameWithType=$(sqlite3 $SqliteBackup "pragma table_info($TableName);" | cut -d '|' -f 2-3)
+	ColumnsNameWithType=$(sed "s/\<$ColumnToRemove\>|[a-zA-Z]\w*//g" <<< "$ColumnsNameWithType")
+	ColumnsNameWithType=$(echo -n $ColumnsNameWithType | sed -e 's/ /,/g')
+	ColumnsNameWithType=$(echo -n $ColumnsNameWithType | sed -e 's/|/ /g')
+	ColumnsName=$(sqlite3 $SqliteBackup "pragma table_info($TableName);" | cut -d '|' -f 2)
+	ColumnsName=$(sed "s/\<$ColumnToRemove\>//g" <<< "$ColumnsName") 
+	ColumnsName=$(echo -n $ColumnsName | sed -e 's/ /,/g')
+	#Create a new database without the row we don't want
+	QuerryToDeleteColumn="
+		BEGIN TRANSACTION;
+		CREATE TEMPORARY TABLE backup($ColumnsNameWithType);
+		INSERT INTO backup SELECT $ColumnsName FROM $TableName;
+		DROP TABLE $TableName;
+		CREATE TABLE $TableName($ColumnsNameWithType);
+		INSERT INTO $TableName SELECT $ColumnsName FROM backup;
+		DROP TABLE backup;
+		COMMIT;
+		"
+	sqlite3 $SqliteBackup "$QuerryToDeleteColumn"
+	MysqlFile="./tempMysql.sql"
+	Dump="./dump.sql"
+	sqlite3 $SqliteBackup .dump > $Dump
+	#Change the dump so we can import table even if the rows aren't the same number
+	sed -i "s/$TableName\"/$TableName\"\($ColumnsName\)/g" $Dump
+	cat $Dump | python sqliteToMysql.py > $MysqlFile
+	Instructions=$(cat $MysqlFile)
+	mysql --user="$4" --password="$5" "$3" << eof 2>&1 | tee -a log.temp
+	use "$3"
+	$Instructions
+eof
+	#If there is been an error, don't delete the original file and put it in a log
+	if [ -s log.temp ]
+	then
+		rm $SqliteFile $SqliteBackup $MysqlFile $Dump log.temp
+	else
+		rm $SqliteBackup $MysqlFile $Dump log.temp
+		echo "Something went wrong"
+		cat log.temp >> addSqliteToMysql.log
+	fi
+}
+
+checkParameters "$@"
+checkDependances
+MonitorDir="$1"
+checkNewFile "$@"
